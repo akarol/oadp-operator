@@ -66,13 +66,39 @@ func (h *HCHandler) RemoveHCP(timeout time.Duration) error {
 	log.Printf("\tWaiting for the HC to be deleted")
 	err := wait.PollUntilContextTimeout(h.Ctx, time.Second*5, timeout, true, func(ctx context.Context) (bool, error) {
 		log.Printf("\tAttempting to verify HC deletion...")
-		result := IsHCDeleted(h)
-		log.Printf("\tHC deletion check result: %v", result)
-		return result, nil
+		deleted, err := IsHCDeleted(h)
+		if err != nil {
+			log.Printf("\tHC deletion check error: %v", err)
+			return false, err
+		}
+		log.Printf("\tHC deletion check result: %v", deleted)
+		return deleted, nil
 	})
 
 	if err != nil {
-		return fmt.Errorf("failed to wait for HC deletion: %v", err)
+		log.Printf("HC deletion timed out, attempting to nuke resources with finalizers")
+		if nukeErr := h.NukeHostedCluster(); nukeErr != nil {
+			return fmt.Errorf("failed to wait for HC deletion (timeout: %v) and failed to nuke resources: %v", err, nukeErr)
+		}
+
+		// Try deletion again after nuking finalizers
+		log.Printf("Retrying HC deletion after removing finalizers")
+		retryErr := wait.PollUntilContextTimeout(h.Ctx, time.Second*5, time.Minute*5, true, func(ctx context.Context) (bool, error) {
+			log.Printf("\tRetry: Attempting to verify HC deletion...")
+			deleted, err := IsHCDeleted(h)
+			if err != nil {
+				log.Printf("\tRetry: HC deletion check error: %v", err)
+				return false, err
+			}
+			log.Printf("\tRetry: HC deletion check result: %v", deleted)
+			return deleted, nil
+		})
+
+		if retryErr != nil {
+			return fmt.Errorf("failed to wait for HC deletion even after removing finalizers (original timeout: %v, retry error: %v)", err, retryErr)
+		}
+
+		log.Printf("\tHC successfully deleted after removing finalizers")
 	}
 
 	return nil
@@ -221,15 +247,50 @@ func (h *HCHandler) DeleteHCSecrets() error {
 
 // WaitForHCDeletion waits for the HostedCluster to be deleted
 func (h *HCHandler) WaitForHCDeletion() error {
-	return wait.PollUntilContextTimeout(h.Ctx, WaitForNextCheckTimeout, Wait10Min, true, func(ctx context.Context) (bool, error) {
-		return IsHCDeleted(h), nil
+	err := wait.PollUntilContextTimeout(h.Ctx, WaitForNextCheckTimeout, Wait10Min, true, func(ctx context.Context) (bool, error) {
+		deleted, err := IsHCDeleted(h)
+		if err != nil {
+			// Return the error to stop polling and propagate the error details
+			return false, err
+		}
+		return deleted, nil
 	})
+
+	if err != nil {
+		log.Printf("HC deletion timed out in WaitForHCDeletion, attempting to nuke resources with finalizers")
+		if nukeErr := h.NukeHostedCluster(); nukeErr != nil {
+			return fmt.Errorf("failed to wait for HC deletion (timeout: %v) and failed to nuke resources: %v", err, nukeErr)
+		}
+
+		// Try deletion again after nuking finalizers
+		log.Printf("Retrying HC deletion after removing finalizers in WaitForHCDeletion")
+		retryErr := wait.PollUntilContextTimeout(h.Ctx, WaitForNextCheckTimeout, time.Minute*5, true, func(ctx context.Context) (bool, error) {
+			deleted, err := IsHCDeleted(h)
+			if err != nil {
+				return false, err
+			}
+			return deleted, nil
+		})
+
+		if retryErr != nil {
+			return fmt.Errorf("failed to wait for HC deletion even after removing finalizers (original timeout: %v, retry error: %v)", err, retryErr)
+		}
+
+		log.Printf("HC successfully deleted after removing finalizers in WaitForHCDeletion")
+	}
+
+	return nil
 }
 
 // WaitForHCPDeletion waits for the HostedControlPlane to be deleted
 func (h *HCHandler) WaitForHCPDeletion(hcp *hypershiftv1.HostedControlPlane) error {
 	return wait.PollUntilContextTimeout(h.Ctx, WaitForNextCheckTimeout, Wait10Min, true, func(ctx context.Context) (bool, error) {
-		return IsHCPDeleted(h, hcp), nil
+		deleted, err := IsHCPDeleted(h, hcp)
+		if err != nil {
+			// Return the error to stop polling and propagate the error details
+			return false, err
+		}
+		return deleted, nil
 	})
 }
 
@@ -237,6 +298,25 @@ func (h *HCHandler) WaitForHCPDeletion(hcp *hypershiftv1.HostedControlPlane) err
 func (h *HCHandler) NukeHostedCluster() error {
 	// List of resource types to check
 	log.Printf("\tNuking HostedCluster")
+
+	// First, handle HostedCluster resources in the clusters namespace
+	if h.HostedCluster != nil {
+		log.Printf("\tNUKE: Checking HostedCluster %s in namespace %s for finalizers", h.HostedCluster.Name, h.HostedCluster.Namespace)
+		hc := &hypershiftv1.HostedCluster{}
+		err := h.Client.Get(h.Ctx, types.NamespacedName{
+			Name:      h.HostedCluster.Name,
+			Namespace: h.HostedCluster.Namespace,
+		}, hc)
+		if err == nil && len(hc.GetFinalizers()) > 0 {
+			log.Printf("\tNUKE: Removing finalizers from HostedCluster %s", hc.Name)
+			hc.SetFinalizers([]string{})
+			if err := h.Client.Update(h.Ctx, hc); err != nil {
+				return fmt.Errorf("\tNUKE: Error removing finalizers from HostedCluster %s: %v", hc.Name, err)
+			}
+		}
+	}
+
+	// Then handle other resources in the HCP namespace
 	resourceTypes := []struct {
 		kind string
 		gvk  schema.GroupVersionKind
@@ -513,10 +593,10 @@ func handleDeploymentValidationFailure(ctx context.Context, ocClient client.Clie
 }
 
 // IsHCPDeleted checks if a HostedControlPlane has been deleted
-func IsHCPDeleted(h *HCHandler, hcp *hypershiftv1.HostedControlPlane) bool {
+func IsHCPDeleted(h *HCHandler, hcp *hypershiftv1.HostedControlPlane) (bool, error) {
 	if hcp == nil {
 		log.Printf("\tNo HCP provided, assuming deleted")
-		return true
+		return true, nil
 	}
 	log.Printf("\tChecking if HCP %s is deleted...", hcp.Name)
 	newHCP := &hypershiftv1.HostedControlPlane{}
@@ -526,20 +606,20 @@ func IsHCPDeleted(h *HCHandler, hcp *hypershiftv1.HostedControlPlane) bool {
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Printf("\tHCP %s is confirmed deleted", hcp.Name)
-			return true
+			return true, nil
 		}
 		log.Printf("\tHCP %s deletion check failed with error: %v", hcp.Name, err)
-		return false
+		return false, fmt.Errorf("failed to check HCP deletion: %w", err)
 	}
 	log.Printf("\tHCP %s still exists", hcp.Name)
-	return false
+	return false, nil
 }
 
 // IsHCDeleted checks if a HostedCluster has been deleted
-func IsHCDeleted(h *HCHandler) bool {
+func IsHCDeleted(h *HCHandler) (bool, error) {
 	if h.HostedCluster == nil {
 		log.Printf("\tNo HostedCluster provided, assuming deleted")
-		return true
+		return true, nil
 	}
 	log.Printf("\tChecking if HC %s is deleted...", h.HostedCluster.Name)
 	newHC := &hypershiftv1.HostedCluster{}
@@ -549,13 +629,13 @@ func IsHCDeleted(h *HCHandler) bool {
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Printf("\tHC %s is confirmed deleted", h.HostedCluster.Name)
-			return true
+			return true, nil
 		}
 		log.Printf("\tHC %s deletion check failed with error: %v", h.HostedCluster.Name, err)
-		return false
+		return false, fmt.Errorf("failed to check HC deletion: %w", err)
 	}
 	log.Printf("\tHC %s still exists", h.HostedCluster.Name)
-	return false
+	return false, nil
 }
 
 // GetHCPNamespace returns the namespace for a HostedControlPlane
