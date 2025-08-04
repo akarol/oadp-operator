@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/openshift/oadp-operator/tests/e2e/lib"
 )
@@ -308,8 +309,15 @@ func (h *HCHandler) NukeHostedCluster() error {
 			Namespace: h.HostedCluster.Namespace,
 		}, hc)
 		if err == nil && len(hc.GetFinalizers()) > 0 {
-			log.Printf("\tNUKE: Removing finalizers from HostedCluster %s", hc.Name)
-			hc.SetFinalizers([]string{})
+			finalizers := hc.GetFinalizers()
+			log.Printf("\tNUKE: HostedCluster %s has finalizers: %v", hc.Name, finalizers)
+
+			// Remove each finalizer found on the HostedCluster
+			for _, finalizer := range finalizers {
+				log.Printf("\tNUKE: Removing finalizer %s from HostedCluster %s", finalizer, hc.Name)
+				controllerutil.RemoveFinalizer(hc, finalizer)
+			}
+
 			if err := h.Client.Update(h.Ctx, hc); err != nil {
 				return fmt.Errorf("\tNUKE: Error removing finalizers from HostedCluster %s: %v", hc.Name, err)
 			}
@@ -338,8 +346,15 @@ func (h *HCHandler) NukeHostedCluster() error {
 
 		for _, item := range obj.Items {
 			if len(item.GetFinalizers()) > 0 {
-				log.Printf("\tNUKE: Removing finalizers from %s %s", rt.kind, item.GetName())
-				item.SetFinalizers([]string{})
+				finalizers := item.GetFinalizers()
+				log.Printf("\tNUKE: %s %s has finalizers: %v", rt.kind, item.GetName(), finalizers)
+
+				// Remove each finalizer found on the resource
+				for _, finalizer := range finalizers {
+					log.Printf("\tNUKE: Removing finalizer %s from %s %s", finalizer, rt.kind, item.GetName())
+					controllerutil.RemoveFinalizer(&item, finalizer)
+				}
+
 				if err := h.Client.Update(h.Ctx, &item); err != nil {
 					return fmt.Errorf("\tNUKE: Error removing finalizers from %s %s: %v", rt.kind, item.GetName(), err)
 				}
