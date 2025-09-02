@@ -65,6 +65,10 @@ IMG ?= quay.io/konveyor/oadp-operator:latest
 # You can override this with environment variable (e.g., export TTL_DURATION=4h)
 TTL_DURATION ?= 1h
 
+# HC_NAME is the name of the HostedCluster to use for HCP tests when
+# hc_backup_restore_mode is set to external. Otherwise, HC_NAME is ignored.
+HC_NAME ?= ""
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -807,6 +811,8 @@ ARTIFACT_DIR ?= /tmp
 HCO_UPSTREAM ?= false
 TEST_VIRT ?= false
 TEST_HCP ?= false
+TEST_HCP_EXTERNAL ?= false
+HCP_EXTERNAL_ARGS ?= ""
 TEST_CLI ?= false
 SKIP_MUST_GATHER  ?= false
 TEST_UPGRADE ?= false
@@ -827,6 +833,12 @@ ifeq ($(TEST_HCP),true)
 	TEST_FILTER += && (hcp)
 else
 	TEST_FILTER += && (! hcp)
+endif
+ifeq ($(TEST_HCP_EXTERNAL),true)
+	TEST_FILTER += && (hcp_external)
+	HCP_EXTERNAL_ARGS = -hc_backup_restore_mode=external -hc_name=$(HC_NAME)
+else
+	TEST_FILTER += && (! hcp_external)
 endif
 ifeq ($(TEST_CLI),true)
 	TEST_FILTER += && (cli)
@@ -852,6 +864,7 @@ test-e2e: test-e2e-setup install-ginkgo ## Run E2E tests against OADP operator i
 	--ginkgo.label-filter="$(TEST_FILTER)" \
 	--ginkgo.junit-report="$(ARTIFACT_DIR)/junit_report.xml" \
 	--ginkgo.timeout=2h \
+	$(HCP_EXTERNAL_ARGS) \
 	$(GINKGO_ARGS)
 
 .PHONY: test-e2e-cleanup
@@ -867,7 +880,6 @@ test-e2e-cleanup: login-required
 	$(OC_CLI) delete restore -n $(OADP_TEST_NAMESPACE) --all --wait=false
 	for restore_name in $(shell $(OC_CLI) get restore -n $(OADP_TEST_NAMESPACE) -o name);do $(OC_CLI) patch "$$restore_name" -n $(OADP_TEST_NAMESPACE) -p '{"metadata":{"finalizers":null}}' --type=merge;done
 	rm -rf $(SETTINGS_TMP)
-
 
 .PHONY: update-non-admin-manifests
 update-non-admin-manifests: NON_ADMIN_CONTROLLER_IMG?=quay.io/konveyor/oadp-non-admin:latest
@@ -892,4 +904,8 @@ endif
 
 .PHONY: build-must-gather
 build-must-gather: check-go ## Build OADP Must-gather binary must-gather/oadp-must-gather
+ifeq ($(SKIP_MUST_GATHER),true)
+	echo "Skipping must-gather build"
+else
 	cd must-gather && go build -mod=mod -a -o oadp-must-gather cmd/main.go
+endif
